@@ -553,6 +553,17 @@
 #define AUTOBAUD              0
 #endif
 
+#ifndef MAGIC_BOOT
+#define MAGIC_BOOT            1
+#endif
+
+#if MAGIC_BOOT
+#define BOOT_KEY_ADDR      ((volatile uint16_t*)(RAMEND - 3))
+#define BOOT_INV_ADDR      ((volatile uint16_t*)(RAMEND - 1))
+#define BOOT_KEY_MAGIC     ((uint16_t)0xB007)
+#define BOOT_KEY_INVERSE   ((uint16_t)0x4FF8) // ~0xB007
+#endif
+
 #if FOUR_PAGE_ERASE && UPDATE_FL
 #undef UPDATE_FL
 #define UPDATE_FL             0
@@ -1737,8 +1748,51 @@ int main(void) {
   );
 //  mcusr = UB_MCUSR;
 //  UB_MCUSR = 0;
+
+#if MAGIC_BOOT
+  // Read magic keys BEFORE calling any function (like watchdogConfig), because
+  // SP starts at RAMEND and rcall pushes return address onto RAMEND/RAMEND-1,
+  // which clobbers *BOOT_INV_ADDR!
+  uint16_t boot_k1 = *BOOT_KEY_ADDR;
+  uint16_t boot_k2 = *BOOT_INV_ADDR;
+  *BOOT_KEY_ADDR = 0;
+  *BOOT_INV_ADDR = 0;
+#endif
+
   watchdogConfig(WATCHDOG_OFF);
 
+  // Unless there was an external reset or valid software boot magic, jump to application
+#if MAGIC_BOOT
+  uint8_t enter_bl = 0;
+  if (mcusr & _BV(EXTRF)) {
+    enter_bl = 1;
+  } else if (mcusr & _BV(WDRF)) {
+    if (boot_k1 == BOOT_KEY_MAGIC && boot_k2 == BOOT_KEY_INVERSE) {
+      enter_bl = 1;
+    }
+  }
+#if VBL
+  zaddress = appstart_vec_loc;
+  uint8_t v1, v2;
+  asm volatile(
+    "lpm %[v1], Z+\n"
+    "lpm %[v2], Z\n"
+    : [v1] "=r"(v1), [v2] "=r"(v2), "+z"(zaddress)
+  );
+  if (v1 == 0xFF && v2 == 0xFF) {
+    enter_bl = 1;
+  }
+#endif
+
+  if (!enter_bl) {
+#if DUAL
+    if (mcusr & _BV(WDRF))
+      dual_boot();
+#endif
+    jmpToAppOpcode();
+    __builtin_unreachable();
+  }
+#else
   // Unless there was an external reset jump to application
 #if !DUAL && !(defined(__AVR_ERRATA_SKIP_JMP_CALL__) && __AVR_ERRATA_SKIP_JMP_CALL__ && \
   !FLASHin8k && !FLASHWRAPS)
@@ -1755,6 +1809,7 @@ int main(void) {
     jmpToAppOpcode();
     __builtin_unreachable ();
   }
+#endif
 #endif
 
 
