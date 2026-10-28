@@ -558,10 +558,28 @@
 #endif
 
 #if MAGIC_BOOT
-#define BOOT_KEY_ADDR      ((volatile uint16_t*)(RAMEND - 3))
-#define BOOT_INV_ADDR      ((volatile uint16_t*)(RAMEND - 1))
+/*
+ * 4-byte handoff block shared with the application at the start of SRAM. The application
+ * reserves it (its .data starts at RAMSTART+4) and the page buffer starts after it, so only
+ * these two parties ever write it. It holds one of:
+ *
+ *  - Boot request (application -> bootloader): key 0xB007 at +0, its inverse 0x4FF8 at +2.
+ *    After a watchdog reset with this request, the bootloader stays in bootloader mode.
+ *  - Reset report (bootloader -> application): written when the bootloader stays in
+ *    bootloader mode, which always ends in a watchdog reset that hides the original cause.
+ *    +0 reset flags (MCUSR) that started the bootloader, +1 their inverse,
+ *    +2 RESET_REPORT_TAG, +3 its inverse.
+ *
+ * The application clears the block at every start, after reading it.
+ */
+#define HANDOFF_ADDR       RAMSTART
+#define HANDOFF_SIZE       4
+#define BOOT_KEY_ADDR      ((volatile uint16_t*)(HANDOFF_ADDR))
+#define BOOT_INV_ADDR      ((volatile uint16_t*)(HANDOFF_ADDR + 2))
 #define BOOT_KEY_MAGIC     ((uint16_t)0xB007)
 #define BOOT_KEY_INVERSE   ((uint16_t)0x4FF8) // ~0xB007
+#define RESET_REPORT       ((volatile uint8_t*)(HANDOFF_ADDR))
+#define RESET_REPORT_TAG   ((uint8_t)0xC3)
 #endif
 
 #if FOUR_PAGE_ERASE && UPDATE_FL
@@ -1103,7 +1121,9 @@ register uint16_t zaddress asm("r30");
  */
 
 // Place rambuffer at 0x100 boundary if at least 32 bytes left for stack rcalls
-#if (RAMSTART & 0xFF) && ((RAMSTART+255) & ~0xFF) + SPM_PAGESIZE + 30 < RAMSTART+RAMSIZE
+#if MAGIC_BOOT                  // Right after the handoff block shared with the application
+#define RAMBUFFER (HANDOFF_ADDR + HANDOFF_SIZE)
+#elif (RAMSTART & 0xFF) && ((RAMSTART+255) & ~0xFF) + SPM_PAGESIZE + 30 < RAMSTART+RAMSIZE
 #define RAMBUFFER ((RAMSTART+255) & ~0xFF)
 #else
 #define RAMBUFFER RAMSTART
@@ -1750,13 +1770,10 @@ int main(void) {
 //  UB_MCUSR = 0;
 
 #if MAGIC_BOOT
-  // Read magic keys BEFORE calling any function (like watchdogConfig), because
-  // SP starts at RAMEND and rcall pushes return address onto RAMEND/RAMEND-1,
-  // which clobbers *BOOT_INV_ADDR!
+  // Not cleared here: staying in the bootloader overwrites the request with the reset
+  // report, and the application clears the block when it starts
   uint16_t boot_k1 = *BOOT_KEY_ADDR;
   uint16_t boot_k2 = *BOOT_INV_ADDR;
-  *BOOT_KEY_ADDR = 0;
-  *BOOT_INV_ADDR = 0;
 #endif
 
   watchdogConfig(WATCHDOG_OFF);
@@ -1814,6 +1831,14 @@ int main(void) {
 
 
 // Start of bootloader
+
+#if MAGIC_BOOT
+  // Leaving the bootloader is a watchdog reset: tell the application what started it
+  RESET_REPORT[0] = mcusr;
+  RESET_REPORT[1] = ~mcusr;
+  RESET_REPORT[2] = RESET_REPORT_TAG;
+  RESET_REPORT[3] = (uint8_t)~RESET_REPORT_TAG;
+#endif
 
   asm volatile("watchdog_setting: " :::);
   asm volatile("ldi_wdto: " :::);
